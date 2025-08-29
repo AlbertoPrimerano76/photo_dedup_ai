@@ -1,0 +1,50 @@
+# ------------------------
+# Formatting & Linting
+# ------------------------
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+skip-string-normalization = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# previously 'extend-select' and 'ignore' were top-level; move them here
+extend-select = [
+  "E", "F",        # pycodestyle/pyflakes
+  "I",             # import sorting
+  "UP",            # pyupgrade
+  "B",             # flake8-bugbear
+  "SIM",           # flake8-simplify
+  "C4",            # flake8-comprehensions
+  "ARG",           # flake8-unused-arguments
+]
+ignore = [
+  "E203",          # handled by Black
+  "B008",          # call in default args (manage case-by-case)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]
+force-single-line = false
+combine-as-imports = true
+
+# ------------------------
+# Typing
+# ------------------------
+[tool.mypy]
+python_version = "3.12"
+files = ["src", "tests"]        # <— tell mypy what to check
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+no_implicit_optional = true
+check_untyped_defs = true
+ignore_missing_imports = true
+namespace_packages = true
+mypy_path = ["src"]
