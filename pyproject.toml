@@ -1,50 +1,30 @@
-# ------------------------
-# Formatting & Linting
-# ------------------------
-[tool.black]
-line-length = 100
-target-version = ["py312"]
-skip-string-normalization = true
-
-[tool.ruff]
-line-length = 100
-target-version = "py312"
-src = ["src", "tests"]
-
-[tool.ruff.lint]
-# previously 'extend-select' and 'ignore' were top-level; move them here
-extend-select = [
-  "E", "F",        # pycodestyle/pyflakes
-  "I",             # import sorting
-  "UP",            # pyupgrade
-  "B",             # flake8-bugbear
-  "SIM",           # flake8-simplify
-  "C4",            # flake8-comprehensions
-  "ARG",           # flake8-unused-arguments
-]
-ignore = [
-  "E203",          # handled by Black
-  "B008",          # call in default args (manage case-by-case)
+[project]
+name = "photo-dedup-ai"
+version = "0.0.2"
+description = "Find and review duplicate / near-duplicate photos and videos with a simple UI."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Alberto Primerano" }]
+dependencies = [
+  "typer>=0.12.3",
+  "rich>=13.7.1",
+  "pydantic>=2.8.0",
 ]
 
-[tool.ruff.lint.isort]
-known-first-party = ["src"]
-force-single-line = false
-combine-as-imports = true
+[project.scripts]
+pdai = "cli:app"
 
-# ------------------------
-# Typing
-# ------------------------
+[tool.setuptools]
+# We’re using a flat `src/` layout (modules, not a package)
+# So we must list the modules explicitly for packaging
+py-modules = ["cli", "logs", "config", "errors"]
+package-dir = {"" = "src"}
+
 [tool.mypy]
-python_version = "3.12"
-files = ["src", "tests"]        # <— tell mypy what to check
-warn_unused_ignores = true
-warn_redundant_casts = true
-warn_return_any = true
-disallow_untyped_defs = true
-disallow_incomplete_defs = true
-no_implicit_optional = true
-check_untyped_defs = true
+files = ["src", "tests"]
+disable_error_code = ["import-untyped"]
+
+[[tool.mypy.overrides]]
+module = ["typer", "typer.*", "rich", "rich.*", "pydantic", "pydantic.*"]
 ignore_missing_imports = true
-namespace_packages = true
-mypy_path = ["src"]

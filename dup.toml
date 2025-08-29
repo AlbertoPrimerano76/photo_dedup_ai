@@ -1,0 +1,7 @@
+# dup.toml
+[scan]
+roots = ["~/Pictures", "/Volumes/Photos"]
+follow_symlinks = false
+ignore_hidden = true
+include_ext = [".jpg", ".jpeg", ".heic", ".mov", ".cr2", ".nef", ".arw", ".dng"]
+db_path = ".pdai/index.sqlite3"
