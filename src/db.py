@@ -1,10 +1,5 @@
 """
-SQLite database bootstrap + files persistence for Photo Dedup AI (Phase 4).
-
-Adds:
-- `files` table (path UNIQUE, size, mtime, ext, media_type)
-- batch upsert helpers
-- simple counters for report
+SQLite database bootstrap + files persistence + exact hashes (Phase 5).
 """
 
 from __future__ import annotations
@@ -20,27 +15,40 @@ class DatabaseError(PdaiError):
     """Raised when the SQLite database cannot be created or accessed."""
 
 
+# Bump schema version for Phase 5
+DB_SCHEMA_VERSION = "3"
+
 _SCHEMA = """
-PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
-PRAGMA foreign_keys=ON;
+    PRAGMA journal_mode=WAL;
+    PRAGMA synchronous=NORMAL;
+    PRAGMA foreign_keys=ON;
 
-CREATE TABLE IF NOT EXISTS meta (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
+    CREATE TABLE IF NOT EXISTS meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
 
-CREATE TABLE IF NOT EXISTS files (
-    id INTEGER PRIMARY KEY,
-    path TEXT NOT NULL UNIQUE,   -- absolute path, normalized
-    size INTEGER NOT NULL,       -- in bytes
-    mtime REAL NOT NULL,         -- POSIX timestamp (float)
-    ext TEXT NOT NULL,           -- lowercase extension with dot
-    media_type TEXT NOT NULL     -- image|raw|video|other
-);
+    CREATE TABLE IF NOT EXISTS files (
+        id INTEGER PRIMARY KEY,
+        path TEXT NOT NULL UNIQUE,   -- absolute path, normalized
+        size INTEGER NOT NULL,       -- in bytes
+        mtime REAL NOT NULL,         -- POSIX timestamp (float)
+        ext TEXT NOT NULL,           -- lowercase extension with dot
+        media_type TEXT NOT NULL     -- image|raw|video|other
+    );
 
-CREATE INDEX IF NOT EXISTS idx_files_media ON files(media_type);
-CREATE INDEX IF NOT EXISTS idx_files_ext ON files(ext);
+    CREATE INDEX IF NOT EXISTS idx_files_media ON files(media_type);
+    CREATE INDEX IF NOT EXISTS idx_files_ext ON files(ext);
+
+    -- Phase 5: exact hashes
+    CREATE TABLE IF NOT EXISTS hashes (
+        file_id INTEGER PRIMARY KEY,
+        blake3 TEXT NOT NULL,
+        sha256 TEXT,
+        FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_hashes_blake3 ON hashes(blake3);
 """
 
 
@@ -66,7 +74,7 @@ class Database:
             )  # autocommit
             self._conn.execute("PRAGMA busy_timeout=5000;")
             self._conn.executescript(_SCHEMA)
-            self._set_meta("schema_version", "2")
+            self._set_meta("schema_version", DB_SCHEMA_VERSION)
         except sqlite3.Error as exc:
             raise DatabaseError(
                 f"Failed to open or initialize DB at {self.path}"
@@ -141,3 +149,58 @@ class Database:
             "SELECT media_type, COUNT(*) FROM files GROUP BY media_type ORDER BY COUNT(*) DESC"
         )
         return [(str(mt), int(cnt)) for (mt, cnt) in cur.fetchall()]
+
+    # --- hashes persistence ---------------------------------------------------
+
+    def upsert_hashes(self, rows: Iterable[Tuple[str, str, Optional[str]]]) -> None:
+        """
+        Upsert many hashes.
+
+        Row tuple shape: (path, blake3, sha256)
+        Note: requires the file row to already exist in `files`.
+        """
+        sql = (
+            "INSERT INTO hashes(file_id, blake3, sha256) "
+            "SELECT id, ?, ? FROM files WHERE path = ? "
+            "ON CONFLICT(file_id) DO UPDATE SET "
+            "  blake3=excluded.blake3, "
+            "  sha256=excluded.sha256"
+        )
+        # We need to pass params in order: (blake3, sha256, path)
+        reordered = ((b3, sha or None, p) for (p, b3, sha) in rows)
+        self.executemany(sql, reordered)
+
+    # --- reporting: exact duplicate groups -----------------------------------
+
+    def exact_dupe_groups(self, limit: Optional[int] = None) -> list[Tuple[str, int]]:
+        """
+        Return groups of exact duplicates as (blake3, count), where count > 1.
+        """
+        sql = (
+            "SELECT blake3, COUNT(*) as c "
+            "FROM hashes "
+            "GROUP BY blake3 "
+            "HAVING COUNT(*) > 1 "
+            "ORDER BY c DESC"
+        )
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        cur = self.execute(sql)
+        return [(str(b3), int(c)) for (b3, c) in cur.fetchall()]
+
+    def paths_for_blake3(
+        self, blake3_hex: str, limit: Optional[int] = None
+    ) -> list[str]:
+        """
+        Fetch file paths for a given blake3 hash.
+        """
+        sql = (
+            "SELECT f.path FROM hashes h "
+            "JOIN files f ON f.id = h.file_id "
+            "WHERE h.blake3 = ? "
+            "ORDER BY f.path"
+        )
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        cur = self.execute(sql, (blake3_hex,))
+        return [str(row[0]) for row in cur.fetchall()]
