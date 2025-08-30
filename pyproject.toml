@@ -18,7 +18,7 @@ pdai = "cli:app"
 [tool.setuptools]
 # We’re using a flat `src/` layout (modules, not a package)
 # So we must list the modules explicitly for packaging
-py-modules = ["cli", "logs", "config", "errors", "db", "walker"]
+py-modules = ["cli", "logs", "config", "errors", "db", "walker", "media"]
 package-dir = {"" = "src"}
 
 [tool.mypy]
