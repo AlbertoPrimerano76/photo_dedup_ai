@@ -1,6 +1,6 @@
 # dup.toml
 [scan]
-roots = ["~/Pictures", "/Volumes/Photos"]
+roots = ["data/samples"]
 follow_symlinks = false
 ignore_hidden = true
 include_ext = [".jpg", ".jpeg", ".heic", ".mov", ".cr2", ".nef", ".arw", ".dng"]

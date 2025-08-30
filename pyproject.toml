@@ -18,12 +18,17 @@ pdai = "cli:app"
 [tool.setuptools]
 # We’re using a flat `src/` layout (modules, not a package)
 # So we must list the modules explicitly for packaging
-py-modules = ["cli", "logs", "config", "errors"]
+py-modules = ["cli", "logs", "config", "errors", "db", "walker"]
 package-dir = {"" = "src"}
 
 [tool.mypy]
 files = ["src", "tests"]
 disable_error_code = ["import-untyped"]
+
+[[tool.mypy.overrides]]
+module = ["pytest"]
+ignore_missing_imports = true
+
 
 [[tool.mypy.overrides]]
 module = ["typer", "typer.*", "rich", "rich.*", "pydantic", "pydantic.*"]

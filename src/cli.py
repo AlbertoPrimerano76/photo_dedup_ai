@@ -3,56 +3,38 @@ Typer-based CLI entrypoint with robust error handling.
 
 Commands:
 - version: show app version (placeholder).
-- scan: Phase 2 placeholder that validates roots and lists candidate files.
-
-Design notes:
-- We validate directories carefully and raise our own InvalidPathError. Typer
-  catches these and we convert them into a clean exit with code 1.
-- We catch unexpected exceptions, log them, and exit with a helpful message
-  without dumping scary stack traces by default. Use -v for DEBUG logs.
+- scan: validates roots (from arg or dup.toml), streams candidate files via walker, and lists them.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Optional
+
 import typer
 
 from config import AppConfig
 from errors import ConfigLoadError, InvalidPathError, InternalError, PdaiError
 from logs import init_logging, get_logger
+from walker import iter_media_files
 
 app = typer.Typer(
-    add_completion=False, no_args_is_help=True, help="Photo Dedup AI (Phase 2 CLI)"
+    add_completion=False,
+    no_args_is_help=True,
+    help="Photo Dedup AI — CLI (Phase 3: walker + DB bootstrap)",
 )
+
+# Initialized in main(); module-level fallback is harmless.
 log = get_logger("pdai")
-
-
-def _validate_folder(p: str) -> Path:
-    """
-    Ensure a folder exists and is a directory. Raise InvalidPathError on failure.
-    """
-    try:
-        path = Path(os.path.expanduser(p)).resolve()
-    except Exception as exc:
-        # Path resolution errors are rare but we handle them to be safe.
-        raise InvalidPathError(f"Invalid path: {p}") from exc
-
-    if not path.exists():
-        raise InvalidPathError(f"Path not found: {path}")
-    if not path.is_dir():
-        raise InvalidPathError(f"Not a directory: {path}")
-    return path
 
 
 @app.callback()
 def main(
     verbose: bool = typer.Option(
-        False, "--verbose", "-v", help="Enable verbose logging"
+        False, "--verbose", "-v", help="Enable verbose (DEBUG) logging"
     ),
 ) -> None:
-    # Initialize logging once per process
+    """Global CLI options and logging setup."""
     init_logging(level="DEBUG" if verbose else "INFO")
     global log
     log = get_logger("pdai.cli")
@@ -62,9 +44,7 @@ def main(
 
 @app.command("version")
 def version_cmd() -> None:
-    """
-    Show version (placeholder until we wire a proper __version__).
-    """
+    """Show version (placeholder until we wire __version__)."""
     typer.echo("photo-dedup-ai v0.0.2")
 
 
@@ -75,72 +55,53 @@ def scan_cmd(
         None, "--config", "-c", help="Path to dup.toml"
     ),
     list_only: bool = typer.Option(
-        True, "--list-only/--no-list-only", help="List files only (Phase 2 placeholder)"
+        True,
+        "--list-only/--no-list-only",
+        help="List files only (placeholder; later phases will persist to DB)",
     ),
 ) -> None:
     """
-    Phase 2 placeholder scan:
-      - loads config (dup.toml if present)
-      - optionally overrides roots with a single folder argument
-      - lists candidate files by extension filters
+    Stream candidate media files and list them.
 
-    On errors:
-      - Gracefully exits with a user-friendly message and exit code 1.
+    - Loads config (dup.toml if present).
+    - If a FOLDER arg is provided, it takes precedence over config roots.
+    - Applies filters: include_ext, ignore_hidden, follow_symlinks.
     """
     try:
         cfg = AppConfig.load(config_file)
 
-        # Determine roots: argument takes precedence over config.
         roots = [Path(folder).resolve()] if folder else cfg.scan.roots
         if not roots:
             raise InvalidPathError(
                 "No folder provided and no roots configured. "
-                "Pass a FOLDER argument or create a dup.toml with [scan.roots]."
+                "Pass a FOLDER argument or create dup.toml with [scan.roots]."
             )
 
         log.info(f"[bold]Scan starting[/]: {len(roots)} root(s)")
         total = 0
 
-        for root in roots:
-            root = _validate_folder(str(root))
-            log.info(f"Root: {root}")
-
-            for dirpath, _, filenames in os.walk(
-                root, followlinks=cfg.scan.follow_symlinks
-            ):
-                pdir = Path(dirpath)
-
-                # Optionally ignore hidden directories; this is cheap and avoids surprises.
-                if cfg.scan.ignore_hidden and any(
-                    part.startswith(".") for part in pdir.parts
-                ):
-                    continue
-
-                for name in filenames:
-                    ext = Path(name).suffix.lower()
-                    if ext in cfg.scan.include_ext:
-                        total += 1
-                        if list_only:
-                            # Print to stdout for easy piping (e.g., | wc -l).
-                            typer.echo(str(pdir / name))
+        for path, _ext in iter_media_files(
+            roots,
+            include_ext=cfg.scan.include_ext,
+            ignore_hidden=cfg.scan.ignore_hidden,
+            follow_symlinks=cfg.scan.follow_symlinks,
+        ):
+            total += 1
+            if list_only:
+                typer.echo(str(path))
 
         log.info(f"[green]Scan complete[/] — candidates: {total}")
 
     except (InvalidPathError, ConfigLoadError) as exc:
-        # Expected, user-facing errors: print a clean message and exit(1).
         log.error(f"[red]Error:[/] {exc}")
-        raise typer.Exit(code=1)  # non-zero indicates failure
+        raise typer.Exit(code=1)
 
     except PdaiError as exc:
-        # Known internal errors: advise user; keep logs useful.
         log.error(f"[red]Internal error:[/] {exc}")
         raise typer.Exit(code=1)
 
-    except Exception:  # pragma: no cover - unexpected edge cases
-        # Unexpected failure: we don't spam a full traceback by default, but
-        # DEBUG mode will show more detail via logging configuration.
-        log.exception("Unexpected error during scan")  # includes traceback
-        # Mask raw error behind a friendly message:
+    except Exception:  # pragma: no cover — unexpected edge cases
+        log.exception("Unexpected error during scan")
         raise typer.Exit(code=1) from InternalError(
             "Unexpected failure. Re-run with -v for details."
         )
