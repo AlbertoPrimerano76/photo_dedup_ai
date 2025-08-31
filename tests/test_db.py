@@ -10,6 +10,6 @@ def test_db_initializes(tmp_path: Path) -> None:
     db = Database(db_path)
     db.connect()
     try:
-        assert db.get_meta("schema_version") == "3"
+        assert db.get_meta("schema_version") == "4"
     finally:
         db.close()

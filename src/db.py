@@ -1,5 +1,5 @@
 """
-SQLite database bootstrap + files persistence + exact hashes (Phase 5).
+SQLite database with files, exact hashes, and image perceptual hashes (Phase 6).
 """
 
 from __future__ import annotations
@@ -15,40 +15,51 @@ class DatabaseError(PdaiError):
     """Raised when the SQLite database cannot be created or accessed."""
 
 
-# Bump schema version for Phase 5
-DB_SCHEMA_VERSION = "3"
+# Bump schema version for Phase 6
+DB_SCHEMA_VERSION = "4"
 
 _SCHEMA = """
-    PRAGMA journal_mode=WAL;
-    PRAGMA synchronous=NORMAL;
-    PRAGMA foreign_keys=ON;
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+PRAGMA foreign_keys=ON;
 
-    CREATE TABLE IF NOT EXISTS meta (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-    );
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 
-    CREATE TABLE IF NOT EXISTS files (
-        id INTEGER PRIMARY KEY,
-        path TEXT NOT NULL UNIQUE,   -- absolute path, normalized
-        size INTEGER NOT NULL,       -- in bytes
-        mtime REAL NOT NULL,         -- POSIX timestamp (float)
-        ext TEXT NOT NULL,           -- lowercase extension with dot
-        media_type TEXT NOT NULL     -- image|raw|video|other
-    );
+CREATE TABLE IF NOT EXISTS files (
+    id INTEGER PRIMARY KEY,
+    path TEXT NOT NULL UNIQUE,   -- absolute path, normalized
+    size INTEGER NOT NULL,       -- in bytes
+    mtime REAL NOT NULL,         -- POSIX timestamp (float)
+    ext TEXT NOT NULL,           -- lowercase extension with dot
+    media_type TEXT NOT NULL     -- image|raw|video|other
+);
 
-    CREATE INDEX IF NOT EXISTS idx_files_media ON files(media_type);
-    CREATE INDEX IF NOT EXISTS idx_files_ext ON files(ext);
+CREATE INDEX IF NOT EXISTS idx_files_media ON files(media_type);
+CREATE INDEX IF NOT EXISTS idx_files_ext ON files(ext);
 
-    -- Phase 5: exact hashes
-    CREATE TABLE IF NOT EXISTS hashes (
-        file_id INTEGER PRIMARY KEY,
-        blake3 TEXT NOT NULL,
-        sha256 TEXT,
-        FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
-    );
+-- Phase 5: exact hashes
+CREATE TABLE IF NOT EXISTS hashes (
+    file_id INTEGER PRIMARY KEY,
+    blake3 TEXT NOT NULL,
+    sha256 TEXT,
+    FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_hashes_blake3 ON hashes(blake3);
 
-    CREATE INDEX IF NOT EXISTS idx_hashes_blake3 ON hashes(blake3);
+-- Phase 6: perceptual hashes for images
+CREATE TABLE IF NOT EXISTS image_hashes (
+    file_id INTEGER PRIMARY KEY,
+    phash INTEGER NOT NULL,      -- 64-bit int
+    dhash INTEGER NOT NULL,      -- 64-bit int
+    width INTEGER,
+    height INTEGER,
+    FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_image_hashes_phash ON image_hashes(phash);
+CREATE INDEX IF NOT EXISTS idx_image_hashes_dhash ON image_hashes(dhash);
 """
 
 
@@ -122,13 +133,9 @@ class Database:
         row = cur.fetchone()
         return row[0] if row else None
 
-    # --- files persistence ----------------------------------------------------
+    # --- files persistence (Phase 4) ------------------------------------------
 
     def upsert_files(self, rows: Iterable[Tuple[str, int, float, str, str]]) -> None:
-        """
-        Upsert many files.
-        Row tuple shape: (path, size, mtime, ext, media_type)
-        """
         sql = (
             "INSERT INTO files(path, size, mtime, ext, media_type) "
             "VALUES (?, ?, ?, ?, ?) "
@@ -150,15 +157,9 @@ class Database:
         )
         return [(str(mt), int(cnt)) for (mt, cnt) in cur.fetchall()]
 
-    # --- hashes persistence ---------------------------------------------------
+    # --- exact hashes (Phase 5) -----------------------------------------------
 
     def upsert_hashes(self, rows: Iterable[Tuple[str, str, Optional[str]]]) -> None:
-        """
-        Upsert many hashes.
-
-        Row tuple shape: (path, blake3, sha256)
-        Note: requires the file row to already exist in `files`.
-        """
         sql = (
             "INSERT INTO hashes(file_id, blake3, sha256) "
             "SELECT id, ?, ? FROM files WHERE path = ? "
@@ -166,16 +167,10 @@ class Database:
             "  blake3=excluded.blake3, "
             "  sha256=excluded.sha256"
         )
-        # We need to pass params in order: (blake3, sha256, path)
         reordered = ((b3, sha or None, p) for (p, b3, sha) in rows)
         self.executemany(sql, reordered)
 
-    # --- reporting: exact duplicate groups -----------------------------------
-
     def exact_dupe_groups(self, limit: Optional[int] = None) -> list[Tuple[str, int]]:
-        """
-        Return groups of exact duplicates as (blake3, count), where count > 1.
-        """
         sql = (
             "SELECT blake3, COUNT(*) as c "
             "FROM hashes "
@@ -191,9 +186,6 @@ class Database:
     def paths_for_blake3(
         self, blake3_hex: str, limit: Optional[int] = None
     ) -> list[str]:
-        """
-        Fetch file paths for a given blake3 hash.
-        """
         sql = (
             "SELECT f.path FROM hashes h "
             "JOIN files f ON f.id = h.file_id "
@@ -204,3 +196,56 @@ class Database:
             sql += f" LIMIT {int(limit)}"
         cur = self.execute(sql, (blake3_hex,))
         return [str(row[0]) for row in cur.fetchall()]
+
+    # --- image perceptual hashes (Phase 6) ------------------------------------
+
+    def upsert_image_hashes(
+        self, rows: Iterable[Tuple[str, int, int, int, int]]
+    ) -> None:
+        """
+        Upsert many image hashes.
+        Row tuple: (path, phash64, dhash64, width, height).
+        """
+        sql = (
+            "INSERT INTO image_hashes(file_id, phash, dhash, width, height) "
+            "SELECT id, ?, ?, ?, ? FROM files WHERE path = ? "
+            "ON CONFLICT(file_id) DO UPDATE SET "
+            "  phash=excluded.phash, "
+            "  dhash=excluded.dhash, "
+            "  width=excluded.width, "
+            "  height=excluded.height"
+        )
+        # Reorder to (phash, dhash, width, height, path)
+        reordered = ((p64, d64, w, h, path) for (path, p64, d64, w, h) in rows)
+        self.executemany(sql, reordered)
+
+    def iter_paths_missing_image_hashes(self, batch: int = 2000) -> Iterable[list[str]]:
+        """
+        Yield paths that are images (files.media_type='image') and missing image_hashes.
+        Batches results to reduce memory pressure.
+        """
+        offset = 0
+        while True:
+            cur = self.execute(
+                "SELECT f.path FROM files f "
+                "LEFT JOIN image_hashes ih ON ih.file_id = f.id "
+                "WHERE f.media_type = 'image' AND ih.file_id IS NULL "
+                "ORDER BY f.id LIMIT ? OFFSET ?",
+                (batch, offset),
+            )
+            rows = [str(r[0]) for r in cur.fetchall()]
+            if not rows:
+                break
+            yield rows
+            offset += batch
+
+    def load_all_image_hashes(self) -> list[Tuple[str, int, int]]:
+        """
+        Return list of (path, phash, dhash) for all images that have hashes.
+        """
+        cur = self.execute(
+            "SELECT f.path, ih.phash, ih.dhash "
+            "FROM image_hashes ih JOIN files f ON f.id = ih.file_id "
+            "ORDER BY f.id"
+        )
+        return [(str(p), int(ph), int(dh)) for (p, ph, dh) in cur.fetchall()]
