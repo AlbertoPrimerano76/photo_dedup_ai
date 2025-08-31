@@ -24,7 +24,10 @@ pdai = "cli:app"
 [tool.setuptools]
 # We’re using a flat `src/` layout (modules, not a package)
 # So we must list the modules explicitly for packaging
-py-modules = ["cli", "logs", "config", "errors", "db", "walker", "media", "hash_exact", "image_phash"]
+py-modules = [
+  "cli","logs","config","errors","db","walker",
+  "media","hash_exact","image_phash","image_match"
+]
 package-dir = {"" = "src"}
 
 [tool.mypy]
@@ -45,5 +48,9 @@ module = ["blake3", "blake3.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = ["PIL", "PIL.*", "pillow_heif", "pillow_heif.*", "cv2", "numpy", "numpy.*", "skimage", "skimage.*"]
+module = ["PIL", "PIL.*", "pillow_heif", "pillow_heif.*", "skimage", "skimage.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["cv2","cv2.*","numpy","numpy.*"]
 ignore_missing_imports = true

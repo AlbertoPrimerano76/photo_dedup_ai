@@ -1,15 +1,17 @@
 """
-CLI entrypoint (Phase 6):
-- scan: list or persist files + exact hashes
-- images-hash: compute pHash/dHash for images
-- dupes: report exact duplicate groups
-- near: cluster near-duplicates by perceptual hashes
+CLI entrypoint (Phase 7):
+- scan: list / persist files + exact hashes
+- images-hash: calcola pHash/dHash e salva
+- dupes: gruppi di duplicati esatti (BLAKE3)
+- near: cluster near-duplicate da pHash/dHash
+- confirm-near: conferma coppie con ORB+RANSAC e cache in DB
 """
 
 from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -20,16 +22,16 @@ from config import AppConfig
 from db import Database
 from errors import ConfigLoadError, InvalidPathError, InternalError, PdaiError
 from hash_exact import compute_hashes
+from image_match import orb_ransac_confirm
 from image_phash import dhash64, hamming64, phash64
 from logs import get_logger, init_logging
 from media import media_type_from_ext
 from walker import iter_media_files
 
-# Typer app
 app = typer.Typer(
     add_completion=False,
     no_args_is_help=True,
-    help="Photo Dedup AI — CLI (Phase 6: exact + perceptual hashes, dupes, near)",
+    help="Photo Dedup AI — CLI (Phase 7: exact+perceptual+ORB)",
 )
 
 log = get_logger("pdai")
@@ -46,7 +48,7 @@ def main(
     log = get_logger("pdai.cli")
     if verbose:
         log.debug("Verbose logging enabled")
-    # HEIC/HEIF opener if pillow-heif is installed
+    # HEIC/HEIF opener se disponibile
     try:
         import pillow_heif  # type: ignore[import-not-found]
 
@@ -58,10 +60,10 @@ def main(
 
 @app.command("version")
 def version_cmd() -> None:
-    typer.echo("photo-dedup-ai v0.0.6")
+    typer.echo("photo-dedup-ai v0.0.7")
 
 
-# ----------------------------- scan -------------------------------------------
+# -------------------------------- scan ----------------------------------------
 
 
 @app.command("scan")
@@ -81,9 +83,9 @@ def scan_cmd(
     ),
 ) -> None:
     """
-    Stream candidate media files.
-    - With --list-only: just print paths.
-    - With --no-list-only: persist into DB (files + exact hashes).
+    Stream dei media file.
+    --list-only: stampa i path
+    --no-list-only: persist a DB (files + hashes)
     """
     db: Optional[Database] = None
     try:
@@ -159,7 +161,7 @@ def scan_cmd(
             db.close()
 
 
-# ----------------------------- dupes ------------------------------------------
+# ------------------------------- dupes ----------------------------------------
 
 
 @app.command("dupes")
@@ -173,7 +175,7 @@ def dupes_cmd(
     ),
     json_out: bool = typer.Option(False, "--json", help="Emit JSON"),
 ) -> None:
-    """Show groups of exact duplicates (same BLAKE3)."""
+    """Gruppi di duplicati esatti (stesso BLAKE3)."""
     db: Optional[Database] = None
     try:
         cfg = AppConfig.load(config_file)
@@ -211,7 +213,7 @@ def dupes_cmd(
             db.close()
 
 
-# --------------------------- images-hash --------------------------------------
+# ---------------------------- images-hash -------------------------------------
 
 
 @app.command("images-hash")
@@ -224,7 +226,7 @@ def images_hash_cmd(
     ),
     batch_size: int = typer.Option(512, "--batch-size", help="DB upsert batch size"),
 ) -> None:
-    """Compute pHash/dHash for images and persist into DB."""
+    """Calcola pHash/dHash per immagini mancanti e salva in DB."""
     from PIL import Image
 
     db: Optional[Database] = None
@@ -270,7 +272,7 @@ def images_hash_cmd(
             db.close()
 
 
-# ------------------------------ near ------------------------------------------
+# -------------------------------- near ----------------------------------------
 
 
 @dataclass
@@ -318,7 +320,7 @@ def near_cmd(
         False, "--paths", help="Print file paths for each cluster"
     ),
 ) -> None:
-    """Cluster near-duplicate images using pHash/dHash Hamming distance."""
+    """Cluster near-duplicate via pHash/dHash (senza ORB)."""
     db: Optional[Database] = None
     try:
         cfg = AppConfig.load(config_file)
@@ -362,6 +364,125 @@ def near_cmd(
                 if show_paths:
                     for p in grp:
                         typer.echo(f"  - {p}")
+
+    except Exception as exc:
+        log.error(f"Error: {exc}")
+        raise typer.Exit(code=1)
+    finally:
+        if db:
+            db.close()
+
+
+# --------------------------- confirm-near (ORB) --------------------------------
+
+
+@app.command("confirm-near")
+def confirm_near_cmd(
+    config_file: Optional[Path] = typer.Option(
+        None, "--config", "-c", help="Path to dup.toml"
+    ),
+    phash_threshold: int = typer.Option(
+        10, "--phash-threshold", help="Max Hamming pHash (candidates)"
+    ),
+    dhash_threshold: int = typer.Option(
+        10, "--dhash-threshold", help="Max Hamming dHash (candidates)"
+    ),
+    use_db_candidates: bool = typer.Option(
+        False, "--db-candidates", help="Candidati via DB (self-join)"
+    ),
+    limit_pairs: Optional[int] = typer.Option(
+        200, "--limit", help="Max coppie da processare"
+    ),
+    max_workers: int = typer.Option(
+        4, "--max-workers", help="Parallel ORB verifications"
+    ),
+    cache: bool = typer.Option(True, "--cache/--no-cache", help="Salva conferme in DB"),
+    min_inliers: int = typer.Option(20, "--min-inliers", help="Min inliers RANSAC"),
+    min_inlier_ratio: float = typer.Option(
+        0.15, "--min-inlier-ratio", help="Min inlier ratio RANSAC"
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Emit JSON"),
+) -> None:
+    """
+    Conferma coppie near-duplicate via ORB+RANSAC e (opzionalmente) cache.
+    """
+    db: Optional[Database] = None
+    try:
+        cfg = AppConfig.load(config_file)
+        db = Database(cfg.scan.db_path)
+        db.connect()
+
+        # Build candidate pairs
+        pairs: list[tuple[str, str]]
+        if use_db_candidates:
+            pairs = db.phash_dhash_candidates(
+                phash_threshold, dhash_threshold, limit_pairs=limit_pairs
+            )
+        else:
+            rows = db.load_all_image_hashes()
+
+            def top_bits(x: int, bits: int = 16) -> int:
+                return (x >> (64 - bits)) & ((1 << bits) - 1)
+
+            buckets: Dict[int, list[tuple[str, int, int]]] = {}
+            for p, ph, dh in rows:
+                buckets.setdefault(top_bits(ph), []).append((p, ph, dh))
+            pairs = []  # <-- no type annotation here
+            for _, items in buckets.items():
+                for i in range(len(items)):
+                    pi, phi, dhi = items[i]
+                    for j in range(i + 1, len(items)):
+                        pj, phj, dhj = items[j]
+                        if (
+                            bin(phi ^ phj).count("1") <= phash_threshold
+                            and bin(dhi ^ dhj).count("1") <= dhash_threshold
+                        ):
+                            pairs.append((pi, pj))
+                            if limit_pairs is not None and len(pairs) >= limit_pairs:
+                                break
+                if limit_pairs is not None and len(pairs) >= limit_pairs:
+                    break
+
+        if not pairs:
+            typer.echo("No candidate pairs to confirm.")
+            return
+
+        results: list[tuple[str, str, bool, int, float]] = []
+
+        def worker(sp: str, dp: str) -> tuple[str, str, bool, int, float]:
+            ok, inl, ratio = orb_ransac_confirm(
+                Path(sp),
+                Path(dp),
+                min_inliers=min_inliers,
+                min_inlier_ratio=min_inlier_ratio,
+            )
+            return (sp, dp, ok, inl, ratio)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = [ex.submit(worker, a, b) for (a, b) in pairs]
+            for f in as_completed(futs):
+                sp, dp, ok, inl, ratio = f.result()
+                if ok:
+                    results.append((sp, dp, ok, inl, ratio))
+
+        if not results:
+            typer.echo("No pairs confirmed by ORB.")
+            return
+
+        if cache:
+            db.upsert_orb_confirm(
+                [(sp, dp, inl, ratio) for (sp, dp, _ok, inl, ratio) in results]
+            )
+
+        if json_out:
+            payload = [
+                {"src": sp, "dst": dp, "inliers": inl, "inlier_ratio": ratio}
+                for (sp, dp, _ok, inl, ratio) in results
+            ]
+            typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            for sp, dp, _ok, inl, ratio in results:
+                typer.echo(f"[OK] inliers={inl:3d} ratio={ratio:.2f}  {sp}  <>  {dp}")
 
     except Exception as exc:
         log.error(f"Error: {exc}")
