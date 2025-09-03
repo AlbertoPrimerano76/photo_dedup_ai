@@ -1,12 +1,14 @@
 """
-SQLite database — Phase 7:
-- files, hashes (exact), image_hashes (perceptual)
-- near_confirms: cache di conferme ORB
+SQLite database — Phase 8:
+- Incremental bookkeeping (files.present, files.seen_at ISO timestamp)
+- Staleness tracking for hashes (hashes.file_mtime, image_hashes.file_mtime)
+- Back-compat wrappers for older call sites/tests (upsert_files, upsert_hashes)
 """
 
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
@@ -17,8 +19,8 @@ class DatabaseError(PdaiError):
     """Raised when the SQLite database cannot be created or accessed."""
 
 
-# Bump schema version per Phase 7
-DB_SCHEMA_VERSION = "5"
+# Phase 8 schema version
+DB_SCHEMA_VERSION = "6"
 
 _SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -36,33 +38,38 @@ CREATE TABLE IF NOT EXISTS files (
     size INTEGER NOT NULL,       -- in bytes
     mtime REAL NOT NULL,         -- POSIX timestamp (float)
     ext TEXT NOT NULL,           -- lowercase extension with dot
-    media_type TEXT NOT NULL     -- image|raw|video|other
+    media_type TEXT NOT NULL,    -- image|raw|video|other
+    present INTEGER NOT NULL DEFAULT 1,                -- 1=present, 0=missing
+    seen_at TEXT NOT NULL DEFAULT ''                   -- ISO8601 last scan touch
 );
 CREATE INDEX IF NOT EXISTS idx_files_media ON files(media_type);
 CREATE INDEX IF NOT EXISTS idx_files_ext ON files(ext);
+CREATE INDEX IF NOT EXISTS idx_files_present ON files(present);
 
--- Phase 5: exact hashes
+-- Exact hashes (Phase 5) + staleness (Phase 8)
 CREATE TABLE IF NOT EXISTS hashes (
     file_id INTEGER PRIMARY KEY,
     blake3 TEXT NOT NULL,
     sha256 TEXT,
+    file_mtime REAL NOT NULL DEFAULT 0,                -- mtime when hash was computed
     FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_hashes_blake3 ON hashes(blake3);
 
--- Phase 6: perceptual hashes (immagini)
+-- Perceptual image hashes (Phase 6) + staleness (Phase 8)
 CREATE TABLE IF NOT EXISTS image_hashes (
     file_id INTEGER PRIMARY KEY,
     phash INTEGER NOT NULL,      -- 64-bit int
     dhash INTEGER NOT NULL,      -- 64-bit int
     width INTEGER,
     height INTEGER,
+    file_mtime REAL NOT NULL DEFAULT 0,                -- mtime when phash/dhash were computed
     FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_image_hashes_phash ON image_hashes(phash);
 CREATE INDEX IF NOT EXISTS idx_image_hashes_dhash ON image_hashes(dhash);
 
--- Phase 7: ORB confirmations cache
+-- ORB confirmations cache (Phase 7)
 CREATE TABLE IF NOT EXISTS near_confirms (
     src_file_id INTEGER NOT NULL,
     dst_file_id INTEGER NOT NULL,
@@ -78,12 +85,18 @@ CREATE INDEX IF NOT EXISTS idx_near_confirms_method ON near_confirms(method);
 """
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 class Database:
     """Thin wrapper around sqlite3 with safe init & helpers."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
         self._conn: Optional[sqlite3.Connection] = None
+
+    # --- lifecycle ------------------------------------------------------------
 
     def connect(self) -> None:
         try:
@@ -113,7 +126,7 @@ class Database:
             finally:
                 self._conn = None
 
-    # --- base helpers ---------------------------------------------------------
+    # --- low-level helpers ----------------------------------------------------
 
     def _ensure(self) -> sqlite3.Connection:
         if self._conn is None:
@@ -146,19 +159,61 @@ class Database:
         row = cur.fetchone()
         return row[0] if row else None
 
-    # --- Phase 4: files -------------------------------------------------------
+    # --- Phase 8: scan tokens & present/seen ----------------------------------
 
-    def upsert_files(self, rows: Iterable[Tuple[str, int, float, str, str]]) -> None:
+    def start_scan_token(self) -> str:
+        """
+        Returns ISO timestamp token to tag seen files in the current scan.
+        """
+        return _now_iso()
+
+    def finalize_scan(self, scan_token: str) -> int:
+        """
+        Mark files not seen in this scan as missing (present=0).
+        Returns number of rows affected.
+        """
+        cur = self.execute(
+            "UPDATE files SET present=0 "
+            "WHERE (seen_at='' OR seen_at < ?) AND present=1",
+            (scan_token,),
+        )
+        return int(cur.rowcount or 0)
+
+    # --- Phase 4 + Phase 8: files upsert with seen_at -------------------------
+
+    def upsert_files_with_seen(
+        self, rows: Iterable[Tuple[str, int, float, str, str, str]]
+    ) -> None:
+        """
+        Upsert many files and stamp seen_at/present.
+        Row tuple: (path, size, mtime, ext, media_type, seen_at_iso)
+        """
         sql = (
-            "INSERT INTO files(path, size, mtime, ext, media_type) "
-            "VALUES (?, ?, ?, ?, ?) "
+            "INSERT INTO files(path, size, mtime, ext, media_type, present, seen_at) "
+            "VALUES (?, ?, ?, ?, ?, 1, ?) "
             "ON CONFLICT(path) DO UPDATE SET "
             "  size=excluded.size, "
             "  mtime=excluded.mtime, "
             "  ext=excluded.ext, "
-            "  media_type=excluded.media_type"
+            "  media_type=excluded.media_type, "
+            "  present=1, "
+            "  seen_at=excluded.seen_at"
         )
         self.executemany(sql, rows)
+
+    # --- Back-compat wrappers (for older tests/callers) -----------------------
+
+    def upsert_files(self, rows: Iterable[Tuple[str, int, float, str, str]]) -> None:
+        """
+        Backward-compatible wrapper for Phase 4 signature:
+        (path, size, mtime, ext, media_type).
+        Stamps present=1 and seen_at=now.
+        """
+        seen = _now_iso()
+        rows_seen = ((p, sz, mt, ext, mtp, seen) for (p, sz, mt, ext, mtp) in rows)
+        self.upsert_files_with_seen(rows_seen)
+
+    # --- counts & reporting ----------------------------------------------------
 
     def count_files(self) -> int:
         cur = self.execute("SELECT COUNT(*) FROM files")
@@ -166,22 +221,54 @@ class Database:
 
     def count_by_media_type(self) -> list[Tuple[str, int]]:
         cur = self.execute(
-            "SELECT media_type, COUNT(*) FROM files GROUP BY media_type ORDER BY COUNT(*) DESC"
+            "SELECT media_type, COUNT(*) FROM files WHERE present=1 GROUP BY media_type ORDER BY COUNT(*) DESC"
         )
         return [(str(mt), int(cnt)) for (mt, cnt) in cur.fetchall()]
 
-    # --- Phase 5: exact hashes ------------------------------------------------
+    # --- Phase 5: exact hashes + staleness ------------------------------------
 
-    def upsert_hashes(self, rows: Iterable[Tuple[str, str, Optional[str]]]) -> None:
+    def upsert_hashes_with_mtime(
+        self, rows: Iterable[Tuple[str, str, Optional[str], float]]
+    ) -> None:
+        """
+        Row: (path, blake3, sha256, file_mtime)
+        """
         sql = (
-            "INSERT INTO hashes(file_id, blake3, sha256) "
-            "SELECT id, ?, ? FROM files WHERE path = ? "
+            "INSERT INTO hashes(file_id, blake3, sha256, file_mtime) "
+            "SELECT id, ?, ?, ? FROM files WHERE path = ? "
             "ON CONFLICT(file_id) DO UPDATE SET "
             "  blake3=excluded.blake3, "
-            "  sha256=excluded.sha256"
+            "  sha256=excluded.sha256, "
+            "  file_mtime=excluded.file_mtime"
         )
-        reordered = ((b3, sha or None, p) for (p, b3, sha) in rows)
+        # reorder to (b3, sha, mtime, path)
+        reordered = ((b3, sha or None, mtime, p) for (p, b3, sha, mtime) in rows)
         self.executemany(sql, reordered)
+
+    def upsert_hashes(self, rows: Iterable[Tuple[str, str, Optional[str]]]) -> None:
+        """
+        Backward-compatible wrapper for Phase 5 signature:
+        (path, blake3, sha256).
+        Uses current files.mtime for file_mtime.
+        """
+        out: list[Tuple[str, str, Optional[str], float]] = []
+        for path, b3, sha in rows:
+            cur = self.execute("SELECT mtime FROM files WHERE path = ?", (path,))
+            row = cur.fetchone()
+            mtime = float(row[0]) if row else 0.0
+            out.append((path, b3, sha, mtime))
+        self.upsert_hashes_with_mtime(out)
+
+    def needs_exact_hash(self, path: str, file_mtime: float) -> bool:
+        """
+        Return True if no row in hashes OR stored file_mtime != current file_mtime.
+        """
+        cur = self.execute(
+            "SELECT h.file_mtime FROM hashes h JOIN files f ON f.id = h.file_id WHERE f.path = ?",
+            (path,),
+        )
+        row = cur.fetchone()
+        return row is None or float(row[0]) != float(file_mtime)
 
     def exact_dupe_groups(self, limit: Optional[int] = None) -> list[Tuple[str, int]]:
         sql = (
@@ -210,40 +297,49 @@ class Database:
         cur = self.execute(sql, (blake3_hex,))
         return [str(row[0]) for row in cur.fetchall()]
 
-    # --- Phase 6: image perceptual hashes ------------------------------------
+    # --- Phase 6: image hashes + staleness ------------------------------------
 
-    def upsert_image_hashes(
-        self, rows: Iterable[Tuple[str, int, int, int, int]]
+    def upsert_image_hashes_with_mtime(
+        self, rows: Iterable[Tuple[str, int, int, int, int, float]]
     ) -> None:
         """
-        rows: (path, phash64, dhash64, width, height)
+        Row: (path, phash64, dhash64, width, height, file_mtime)
         """
         sql = (
-            "INSERT INTO image_hashes(file_id, phash, dhash, width, height) "
-            "SELECT id, ?, ?, ?, ? FROM files WHERE path = ? "
+            "INSERT INTO image_hashes(file_id, phash, dhash, width, height, file_mtime) "
+            "SELECT id, ?, ?, ?, ?, ? FROM files WHERE path = ? "
             "ON CONFLICT(file_id) DO UPDATE SET "
             "  phash=excluded.phash, "
             "  dhash=excluded.dhash, "
             "  width=excluded.width, "
-            "  height=excluded.height"
+            "  height=excluded.height, "
+            "  file_mtime=excluded.file_mtime"
         )
-        reordered = ((p64, d64, w, h, path) for (path, p64, d64, w, h) in rows)
+        # reorder to (phash, dhash, w, h, mtime, path)
+        reordered = (
+            (p64, d64, w, h, mtime, path) for (path, p64, d64, w, h, mtime) in rows
+        )
         self.executemany(sql, reordered)
 
-    def iter_paths_missing_image_hashes(self, batch: int = 2000) -> Iterable[list[str]]:
+    def iter_paths_needing_image_hashes(
+        self, batch: int = 2000
+    ) -> Iterable[list[Tuple[str, float]]]:
         """
-        Yield dei path immagine (files.media_type='image') che non hanno image_hashes.
+        Yield (path, file_mtime) for images that need (re)hashing:
+        - missing in image_hashes OR image_hashes.file_mtime != files.mtime
+        Only considers present=1.
         """
         offset = 0
         while True:
             cur = self.execute(
-                "SELECT f.path FROM files f "
+                "SELECT f.path, f.mtime FROM files f "
                 "LEFT JOIN image_hashes ih ON ih.file_id = f.id "
-                "WHERE f.media_type = 'image' AND ih.file_id IS NULL "
+                "WHERE f.media_type = 'image' AND f.present=1 "
+                "AND (ih.file_id IS NULL OR ih.file_mtime != f.mtime) "
                 "ORDER BY f.id LIMIT ? OFFSET ?",
                 (batch, offset),
             )
-            rows = [str(r[0]) for r in cur.fetchall()]
+            rows = [(str(r[0]), float(r[1])) for r in cur.fetchall()]
             if not rows:
                 break
             yield rows
@@ -253,6 +349,7 @@ class Database:
         cur = self.execute(
             "SELECT f.path, ih.phash, ih.dhash "
             "FROM image_hashes ih JOIN files f ON f.id = ih.file_id "
+            "WHERE f.present=1 "
             "ORDER BY f.id"
         )
         return [(str(p), int(ph), int(dh)) for (p, ph, dh) in cur.fetchall()]
@@ -260,9 +357,6 @@ class Database:
     # --- Phase 7: ORB confirmations ------------------------------------------
 
     def upsert_orb_confirm(self, pairs: Iterable[Tuple[str, str, int, float]]) -> None:
-        """
-        pairs: (src_path, dst_path, inliers, inlier_ratio)
-        """
         sql = (
             "INSERT INTO near_confirms(src_file_id, dst_file_id, method, inliers, inlier_ratio) "
             "SELECT s.id, d.id, 'orb', ?, ? "
@@ -289,16 +383,14 @@ class Database:
             (str(a), str(b), int(inl), float(r)) for (a, b, inl, r) in cur.fetchall()
         ]
 
+    # --- Candidate generation (same logic as CLI 'near') ----------------------
+
     def phash_dhash_candidates(
         self,
         phash_threshold: int,
         dhash_threshold: int,
         limit_pairs: int | None = None,
     ) -> list[Tuple[str, str]]:
-        """
-        Genera coppie candidate via pHash/dHash (self-join lato client).
-        Uso: datasets medio-piccoli. Per grandi, preferire bucketing in CLI.
-        """
         rows = self.load_all_image_hashes()
 
         def top_bits(x: int, bits: int = 16) -> int:

@@ -35,22 +35,16 @@ files = ["src", "tests"]
 disable_error_code = ["import-untyped"]
 
 [[tool.mypy.overrides]]
-module = ["pytest"]
-ignore_missing_imports = true
-
-
-[[tool.mypy.overrides]]
-module = ["typer", "typer.*", "rich", "rich.*", "pydantic", "pydantic.*"]
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = ["blake3", "blake3.*"]
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = ["PIL", "PIL.*", "pillow_heif", "pillow_heif.*", "skimage", "skimage.*"]
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = ["cv2","cv2.*","numpy","numpy.*"]
+module = [
+  "pytest",
+  "typer", "typer.*",
+  "rich", "rich.*",
+  "pydantic", "pydantic.*",
+  "blake3", "blake3.*",
+  "PIL", "PIL.*",
+  "pillow_heif", "pillow_heif.*",
+  "skimage", "skimage.*",
+  "cv2", "cv2.*",
+  "numpy", "numpy.*"
+]
 ignore_missing_imports = true

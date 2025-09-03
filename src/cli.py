@@ -63,7 +63,7 @@ def version_cmd() -> None:
     typer.echo("photo-dedup-ai v0.0.7")
 
 
-# -------------------------------- scan ----------------------------------------
+# ----------------------------- scan (incremental) -----------------------------
 
 
 @app.command("scan")
@@ -81,27 +81,48 @@ def scan_cmd(
     sha256: bool = typer.Option(
         False, "--sha256", help="Also compute SHA-256 (slower)"
     ),
+    incremental: bool = typer.Option(
+        True, "--incremental/--no-incremental", help="Skip hashing unchanged files"
+    ),
 ) -> None:
     """
-    Stream dei media file.
-    --list-only: stampa i path
-    --no-list-only: persist a DB (files + hashes)
+    Stream candidate media files.
+    - With --list-only: just print paths (NO DB).
+    - With --no-list-only: persist into DB (files + exact hashes) incrementally.
     """
     db: Optional[Database] = None
     try:
         cfg = AppConfig.load(config_file)
-        db = Database(cfg.scan.db_path)
-        db.connect()
-        log.info(f"DB ready at: {cfg.scan.db_path}")
 
         roots = [folder.resolve()] if folder else cfg.scan.roots
         if not roots:
             raise InvalidPathError("No folder provided and no roots configured.")
 
+        # FAST PATH: list-only — DO NOT open the DB.
+        if list_only:
+            total = 0
+            for path, _ext in iter_media_files(
+                roots,
+                include_ext=cfg.scan.include_ext,
+                ignore_hidden=cfg.scan.ignore_hidden,
+                follow_symlinks=cfg.scan.follow_symlinks,
+            ):
+                typer.echo(str(path))
+                total += 1
+            log.info(f"[green]Scan complete[/] — candidates: {total}")
+            return
+
+        # PERSIST PATH: open DB only here
+        db = Database(cfg.scan.db_path)
+        db.connect()
+        log.info(f"DB ready at: {cfg.scan.db_path}")
+
+        scan_token = db.start_scan_token()
+
         log.info(f"[bold]Scan starting[/]: {len(roots)} root(s)")
         total = 0
-        file_batch: list[Tuple[str, int, float, str, str]] = []
-        hash_batch: list[Tuple[str, str, Optional[str]]] = []
+        files_batch: list[Tuple[str, int, float, str, str, str]] = []
+        hashes_batch: list[Tuple[str, str, Optional[str], float]] = []
 
         for path, ext in iter_media_files(
             roots,
@@ -110,38 +131,50 @@ def scan_cmd(
             follow_symlinks=cfg.scan.follow_symlinks,
         ):
             total += 1
-            if list_only:
-                typer.echo(str(path))
-                continue
-
             try:
                 st = os.stat(path, follow_symlinks=True)
             except OSError:
                 continue
 
             mtype = media_type_from_ext(ext)
-            file_batch.append(
-                (str(path), int(st.st_size), float(st.st_mtime), ext, mtype)
+            files_batch.append(
+                (str(path), int(st.st_size), float(st.st_mtime), ext, mtype, scan_token)
             )
 
-            try:
-                b3, s256 = compute_hashes(path, with_sha256=sha256)
-                hash_batch.append((str(path), b3, s256))
-            except OSError:
-                continue
+            # exact hash recompute only if needed
+            do_hash = True
+            if incremental:
+                try:
+                    do_hash = db.needs_exact_hash(str(path), float(st.st_mtime))
+                except Exception:
+                    do_hash = True
+            if do_hash:
+                try:
+                    b3, s256 = compute_hashes(path, with_sha256=sha256)
+                    hashes_batch.append((str(path), b3, s256, float(st.st_mtime)))
+                except OSError:
+                    pass
 
-            if len(file_batch) >= batch_size:
-                db.upsert_files(file_batch)
-                db.upsert_hashes(hash_batch)
-                log.debug(f"Upserted {len(file_batch)} files, {len(hash_batch)} hashes")
-                file_batch.clear()
-                hash_batch.clear()
+            if len(files_batch) >= batch_size:
+                db.upsert_files_with_seen(files_batch)
+                if hashes_batch:
+                    db.upsert_hashes_with_mtime(hashes_batch)
+                log.debug(
+                    f"Upserted {len(files_batch)} files, {len(hashes_batch)} hashes"
+                )
+                files_batch.clear()
+                hashes_batch.clear()
 
-        if not list_only:
-            if file_batch:
-                db.upsert_files(file_batch)
-            if hash_batch:
-                db.upsert_hashes(hash_batch)
+        if files_batch:
+            db.upsert_files_with_seen(files_batch)
+        if hashes_batch:
+            db.upsert_hashes_with_mtime(hashes_batch)
+
+        gone = db.finalize_scan(scan_token)
+        if gone:
+            log.info(
+                f"[yellow]Marked missing[/]: {gone} file(s) not seen in this scan)"
+            )
 
         log.info(f"[green]Scan complete[/] — candidates: {total}")
 
@@ -156,6 +189,73 @@ def scan_cmd(
         raise typer.Exit(code=1) from InternalError(
             "Unexpected failure. Re-run with -v for details."
         )
+    finally:
+        if db:
+            db.close()
+
+
+# ---------------------------- images-hash (incremental) -----------------------
+
+
+@app.command("images-hash")
+def images_hash_cmd(
+    config_file: Optional[Path] = typer.Option(
+        None, "--config", "-c", help="Path to dup.toml"
+    ),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", help="Limit number of images to hash"
+    ),
+    batch_size: int = typer.Option(512, "--batch-size", help="DB upsert batch size"),
+    max_pixels: Optional[int] = typer.Option(
+        24_000_000,
+        "--max-pixels",
+        help="Skip images with width*height above this (default ~24MP)",
+    ),
+) -> None:
+    """Compute pHash/dHash only for images missing or stale; persist into DB."""
+    from PIL import Image
+
+    db: Optional[Database] = None
+    try:
+        cfg = AppConfig.load(config_file)
+        db = Database(cfg.scan.db_path)
+        db.connect()
+
+        to_go = limit if limit is not None else float("inf")
+        total = 0
+        for entries in db.iter_paths_needing_image_hashes(batch=batch_size):
+            rows = []
+            for spath, file_mtime in entries:
+                if to_go <= 0:
+                    break
+                p = Path(spath)
+                try:
+                    with Image.open(p) as im:
+                        w, h = im.size
+                    if max_pixels is not None and (w * h) > int(max_pixels):
+                        # Skip very large images quickly
+                        continue
+                    p64 = phash64(p)
+                    d64 = dhash64(p)
+                    rows.append((str(p), p64, d64, w, h, float(file_mtime)))
+                    total += 1
+                    to_go -= 1
+                except Exception:
+                    log.debug(f"skip (cannot hash): {p}")
+                    continue
+            if rows:
+                db.upsert_image_hashes_with_mtime(rows)
+                log.info(f"Hashed {len(rows)} images (total {total})")
+            if to_go <= 0:
+                break
+        if total == 0:
+            log.info("No images needed hashing (all up-to-date).")
+        else:
+            log.info(f"[green]Done[/] — hashed images: {total}")
+
+    except Exception as exc:
+        log.error(f"Error: {exc}")
+        raise typer.Exit(code=1)
     finally:
         if db:
             db.close()
@@ -211,68 +311,6 @@ def dupes_cmd(
     finally:
         if db:
             db.close()
-
-
-# ---------------------------- images-hash -------------------------------------
-
-
-@app.command("images-hash")
-def images_hash_cmd(
-    config_file: Optional[Path] = typer.Option(
-        None, "--config", "-c", help="Path to dup.toml"
-    ),
-    limit: Optional[int] = typer.Option(
-        None, "--limit", help="Limit number of images to hash"
-    ),
-    batch_size: int = typer.Option(512, "--batch-size", help="DB upsert batch size"),
-) -> None:
-    """Calcola pHash/dHash per immagini mancanti e salva in DB."""
-    from PIL import Image
-
-    db: Optional[Database] = None
-    try:
-        cfg = AppConfig.load(config_file)
-        db = Database(cfg.scan.db_path)
-        db.connect()
-
-        to_go = limit if limit is not None else float("inf")
-        total = 0
-        for paths in db.iter_paths_missing_image_hashes(batch=batch_size):
-            rows = []
-            for spath in paths:
-                if to_go <= 0:
-                    break
-                p = Path(spath)
-                try:
-                    with Image.open(p) as im:
-                        w, h = im.size
-                    p64 = phash64(p)
-                    d64 = dhash64(p)
-                    rows.append((str(p), p64, d64, w, h))
-                    total += 1
-                    to_go -= 1
-                except Exception:
-                    log.debug(f"skip (cannot hash): {p}")
-                    continue
-            if rows:
-                db.upsert_image_hashes(rows)
-                log.info(f"Hashed {len(rows)} images (total {total})")
-            if to_go <= 0:
-                break
-        if total == 0:
-            log.info("No new images needed hashing.")
-        else:
-            log.info(f"[green]Done[/] — hashed images: {total}")
-
-    except Exception as exc:
-        log.error(f"Error: {exc}")
-        raise typer.Exit(code=1)
-    finally:
-        if db:
-            db.close()
-
-
-# -------------------------------- near ----------------------------------------
 
 
 @dataclass
